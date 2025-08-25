@@ -1,6 +1,8 @@
+from collections import namedtuple
+
 import torch
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
-from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
+from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss, FocalLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
 
@@ -154,3 +156,110 @@ class DC_and_topk_loss(nn.Module):
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
+
+
+class DC_and_Focal_loss(nn.Module):
+    def __init__(self, soft_dice_kwargs, focal_kwargs, weight_focal=1, weight_dice=1,
+                 dice_class=SoftDiceLoss):
+        """
+        Weights for CE and Dice do not need to sum to one. You can set whatever you want.
+        :param soft_dice_kwargs:
+        :param focal_kwargs:
+        :param aggregate:
+        :param square_dice:
+        :param weight_focal:
+        :param weight_dice:
+        """
+        super(DC_and_Focal_loss, self).__init__()
+
+        self.weight_dice = weight_dice
+        self.weight_focal = weight_focal
+
+        self.focal = FocalLoss(**focal_kwargs)
+        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        """
+        target must be b, c, x, y(, z) with c=1
+        :param net_output:
+        :param target:
+        :return:
+        """
+        dc_loss = self.dc(net_output, target, loss_mask=None) \
+            if self.weight_dice != 0 else 0
+        ce_loss = self.focal(net_output, target) \
+            if self.weight_focal != 0 else 0
+
+        result = self.weight_focal * ce_loss + self.weight_dice * dc_loss
+        return result
+
+
+class DC_and_CE_smooth_loss(nn.Module):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
+                 dice_class=SoftDiceLoss, smooth_mapping=None):
+        """
+        Weights for CE and Dice do not need to sum to one. You can set whatever you want.
+        :param soft_dice_kwargs:
+        :param ce_kwargs:
+        :param aggregate:
+        :param square_dice:
+        :param weight_ce:
+        :param weight_dice:
+        """
+        super(DC_and_CE_smooth_loss, self).__init__()
+        if ignore_label is not None:
+            raise NotImplementedError
+
+        self.weight_dice = weight_dice
+        self.weight_ce = weight_ce
+        self.ignore_label = ignore_label
+
+        if smooth_mapping is None: # default for single pulp
+            def smooth_tensor(cls_id, smooth_ids, smooth=0.1):
+                if not isinstance(smooth_ids, list):
+                    smooth_ids = [smooth_ids]
+                temp = torch.zeros(47, device='cuda')
+                temp[smooth_ids] = smooth / len(smooth_ids)
+                temp[cls_id] = 1 - smooth
+                return temp
+            smooth_mapping = {3: smooth_tensor(3, 43), 4: smooth_tensor(4, 44),
+                              5: smooth_tensor(5, 6), 6: smooth_tensor(6, 5),
+                              11: smooth_tensor(11, [12, 19, 46]), 19: smooth_tensor(19, [11, 20, 46]),
+                              27: smooth_tensor(27, [28, 35, 46]), 35: smooth_tensor(35, [27, 36, 46]),
+                              43: smooth_tensor(43, 3), 44: smooth_tensor(44, 4),
+                              }
+            for i in list(range(12, 18)) + list(range(20, 26)) + list(range(28, 34)) + list(range(36, 42)):
+                smooth_mapping[i] = smooth_tensor(i, [i-1, i+1, 46])
+            for i in [18, 26, 34, 42]:
+                smooth_mapping[i] = smooth_tensor(i, [i-1, 46])
+        self.smooth_mapping = smooth_mapping
+        onehot_tensor = torch.eye(len(next(iter(self.smooth_mapping.values()))), device='cuda')
+        for k, v in smooth_mapping.items():
+            onehot_tensor[k] = v
+        assert (onehot_tensor.argmax(dim=1) == torch.arange(onehot_tensor.shape[0], device=onehot_tensor.device)).all()
+
+        self.onehot_tensor = onehot_tensor
+        self.ce = nn.CrossEntropyLoss(**ce_kwargs)
+        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        """
+        target must be b, c, x, y(, z) with c=1
+        :param net_output:
+        :param target:
+        :return:
+        """
+        target = self.onehot_tensor[target[:, 0].long()].permute(0, -1, *(i + 1 for i in range(target.ndim-2))).to(device=net_output.device)
+
+        dc_loss = self.dc(net_output, target, loss_mask=None) if self.weight_dice != 0 else 0
+        ce_loss = self.ce(net_output, target) if self.weight_ce != 0 else 0
+
+        result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        return result
+
+
+if __name__ == '__main__':
+    loss_func = DC_and_CE_smooth_loss({'smooth': 1e-5, 'do_bg': False}, {},
+                                        dice_class=MemoryEfficientSoftDiceLoss)
+    # print(loss_func.smooth_mapping)
+    # print(loss_func(torch.randn(2, 47, 8, 8, 8), torch.randint(0, 47, (2, 1, 8, 8, 8))))

@@ -11,6 +11,7 @@ from threadpoolctl import threadpool_limits
 from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
+from nnunetv2.training.dataloading.simulate_clicks import sample_clicks_from_mask
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
@@ -27,7 +28,7 @@ class nnUNetDataLoader(DataLoader):
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
-                 transforms=None):
+                 transforms=None, pad_val=0):
         """
         If we get a 2D patch size, make it pseudo 3D and remember to remove the singleton dimension before
         returning the batch
@@ -65,6 +66,7 @@ class nnUNetDataLoader(DataLoader):
         self.get_do_oversample = self._oversample_last_XX_percent if not probabilistic_oversampling \
             else self._probabilistic_oversampling
         self.transforms = transforms
+        self.pad_val = pad_val
 
     def _oversample_last_XX_percent(self, sample_idx: int) -> bool:
         """
@@ -181,11 +183,11 @@ class nnUNetDataLoader(DataLoader):
             # self._data.load_case(i) (see nnUNetDataset.load_case)
             shape = data.shape[1:]
 
-            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties.get('class_locations', None))
             bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
             # use ACVL utils for that. Cleaner.
-            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            data_all[j] = crop_and_pad_nd(data, bbox, self.pad_val)
 
             seg_cropped = crop_and_pad_nd(seg, bbox, -1)
             if seg_prev is not None:
@@ -216,6 +218,142 @@ class nnUNetDataLoader(DataLoader):
             return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
+
+class nnUNetDataLoaderSemiSupervised(nnUNetDataLoader):
+    def generate_train_batch(self):
+        selected_keys = self.get_indices()
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+
+        for j, i in enumerate(selected_keys):
+            # oversampling foreground will improve stability of model training, especially if many patches are empty
+            # (Lung for example)
+
+            data, seg, seg_prev, properties = self._data.load_case(i)
+
+            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+            # self._data.load_case(i) (see nnUNetDataset.load_case)
+            shape = data.shape[1:]
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, False, properties.get('class_locations', None))
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+            # use ACVL utils for that. Cleaner.
+            data_all[j] = crop_and_pad_nd(data, bbox, self.pad_val)
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    images = []
+                    aug_images = []
+                    for b in range(self.batch_size):
+                        tmp = self.transforms[0](**{'image': data_all[b]})
+                        images.append(tmp['image'])
+                        tmp = self.transforms[1](**tmp)
+                        aug_images.append(tmp['image'])
+                    data_all = torch.stack(images)
+                    aug_data_all = torch.stack(aug_images)
+
+                    del images, aug_images
+            return {'data': data_all, 'aug_data': aug_data_all, 'keys': selected_keys}
+        else:
+            raise NotImplementedError
+
+
+class nnUNetDataLoaderWithClick(nnUNetDataLoader):
+    def __init__(self, *args, noclick_p=0.1, clicks_n_range=(1, 11), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.noclick_p = noclick_p
+        self.clicks_n_range = clicks_n_range
+
+    def generate_train_batch(self):
+        selected_keys = self.get_indices()
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            # oversampling foreground will improve stability of model training, especially if many patches are empty
+            # (Lung for example)
+            force_fg = self.get_do_oversample(j)
+
+            data, seg, seg_prev, properties = self._data.load_case(i)
+
+            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+            # self._data.load_case(i) (see nnUNetDataset.load_case)
+            shape = data.shape[1:]
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties.get('class_locations', None))
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+            # use ACVL utils for that. Cleaner.
+            data_all[j] = crop_and_pad_nd(data, bbox, self.pad_val)
+
+            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+            if seg_prev is not None:
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+            seg_all[j] = seg_cropped
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    images = []
+                    segs = []
+                    points, labels = [], []
+                    for b in range(self.batch_size):
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        images.append(tmp['image'])
+                        # print([x.shape for x in tmp['segmentation']]) seg is a list of multiple seg from big to small
+                        segs.append(tmp['segmentation'])
+                        seg = tmp['segmentation'][0].squeeze(0) if isinstance(tmp['segmentation'], list) else tmp['segmentation'].squeeze(0)
+                        point, label = [], []
+                        for cls_id in torch.unique(seg):
+                            if cls_id == 0:
+                                continue
+                            else:
+                                cls_mask = seg == cls_id
+                                if torch.sum(cls_mask) > 10 and np.random.uniform() >= self.noclick_p: # arbitrary threshold
+                                    sampled_point = sample_clicks_from_mask(cls_mask.numpy(), num_clicks=np.random.randint(*self.clicks_n_range))
+                                    sampled_label = [cls_id - 1 for _ in range(len(sampled_point))]
+                                    point.extend(sampled_point)
+                                    label.extend(sampled_label)
+                        points.append(torch.tensor(point, dtype=torch.float32).reshape(-1, 3)) # n x 3
+                        labels.append(torch.tensor(label, dtype=torch.int16)) # n
+                    data_all = torch.stack(images)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images
+                    if self.batch_size == 1:
+                        points = torch.stack(points).reshape(self.batch_size, -1, 3) # b x n x 3
+                        labels = torch.stack(labels).reshape(self.batch_size, -1) # b x n
+                    else:
+                        max_n = max(len(p) for p in points)
+                        if max_n > 0:
+                            temp_points = torch.zeros((self.batch_size, max_n, 3), dtype=torch.float32)
+                            temp_labels = -torch.ones((self.batch_size, max_n), dtype=torch.int16)
+                            for i in range(self.batch_size):
+                                temp_points[i, :len(points[i])] = points[i]
+                                temp_labels[i, :len(labels[i])] = labels[i]
+                            points, labels = temp_points, temp_labels
+                        else:
+                            points = torch.zeros((self.batch_size, 0, 3), dtype=torch.float32)
+                            labels = torch.zeros((self.batch_size, 0), dtype=torch.int16)
+            return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'point_coords': points, 'point_labels': labels}
+        else:
+            raise NotImplementedError
 
 
 if __name__ == '__main__':

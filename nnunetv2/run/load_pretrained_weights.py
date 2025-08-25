@@ -24,6 +24,7 @@ def load_pretrained_weights(network, fname, verbose=False):
 
     skip_strings_in_pretrained = [
         '.seg_layers.',
+        '.point_encoder.', '.cross_attention.', '.position_encoder.',
     ]
 
     if isinstance(network, DDP):
@@ -56,6 +57,26 @@ def load_pretrained_weights(network, fname, verbose=False):
 
     pretrained_dict = {k: v for k, v in pretrained_dict.items()
                        if k in model_dict.keys() and all([i not in k for i in skip_strings_in_pretrained])}
+    for key, value in model_dict.items():
+        if '.seg_layers.' in key:
+            continue
+        if any([i in key for i in skip_strings_in_pretrained]) and key in saved_model['network_weights']:
+            if value.shape == saved_model['network_weights'][key].shape:
+                pretrained_dict[key] = saved_model['network_weights'][key]
+                print(f'loading k as all shape matched')
+    # add seg layer if shape match (for finetune only)
+    seg_layer_dict, all_matched = {}, True
+    for key, value in model_dict.items():
+        if '.seg_layers.' in key and key in saved_model['network_weights']:
+            if value.shape == saved_model['network_weights'][key].shape:
+                seg_layer_dict[key] = saved_model['network_weights'][key]
+            else:
+                all_matched = False
+                print('seg_layer shape mismatch, not loaded for finetuning')
+                break
+    if len(seg_layer_dict) and all_matched:
+        pretrained_dict.update(seg_layer_dict)
+        print('seg_layer shape all matched, loading for finetuning')
 
     model_dict.update(pretrained_dict)
 

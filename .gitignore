@@ -113,4 +113,6 @@ ENV/
 
 *.model
 
+data/
+pretrained_weights/
 !documentation/assets/scribble_example.png

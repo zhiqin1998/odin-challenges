@@ -203,11 +203,16 @@ def run_training(dataset_name_or_id: Union[str, int],
             cudnn.deterministic = False
             cudnn.benchmark = True
 
+        if not (continue_training or only_run_validation) and isfile(join(nnunet_trainer.output_folder, 'checkpoint_final.pth')):
+            raise RuntimeError("training already completed, are you sure the configuration is correct?")
+
         if not only_run_validation:
             nnunet_trainer.run_training()
 
         if val_with_best:
             nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
+        if fold == 'all' and not only_run_validation: # skip actual validation if training on all
+            return
         nnunet_trainer.perform_actual_validation(export_validation_probabilities)
 
 

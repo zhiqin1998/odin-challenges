@@ -151,6 +151,8 @@ class nnUNetTrainer(object):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
+        self.clip_grap_norm = 12
+        self.accumulate_steps = 0
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -184,7 +186,7 @@ class nnUNetTrainer(object):
         # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
 
         ### checkpoint saving stuff
-        self.save_every = 50
+        self.save_every = 10
         self.disable_checkpointing = False
 
         self.was_initialized = False
@@ -205,7 +207,7 @@ class nnUNetTrainer(object):
 
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
-
+            self.print_to_log_file(f'in_chan: {self.num_input_channels}\tout chan: {self.label_manager.num_segmentation_heads}')
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
@@ -215,7 +217,7 @@ class nnUNetTrainer(object):
                 self.enable_deep_supervision
             ).to(self.device)
             # compile network for free speedup
-            if self._do_i_compile():
+            if self._do_i_compile():# and 'UMamba' not in self.configuration_manager.network_arch_class_name:
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
 
@@ -657,6 +659,12 @@ class nnUNetTrainer(object):
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
+        # # set step to max len
+        # self.num_iterations_per_epoch = int(np.ceil(len(dataset_tr.identifiers) / self.batch_size))
+        # self.print_to_log_file(f"reconfiguring num_iterations_per_epoch to {self.num_iterations_per_epoch}")
+        # self.num_val_iterations_per_epoch = int(np.ceil(len(dataset_val.identifiers) / max(self.batch_size // 2, 1)))
+        # self.print_to_log_file(f"reconfiguring num_val_iterations_per_epoch to {self.num_val_iterations_per_epoch}")
+
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
@@ -664,7 +672,7 @@ class nnUNetTrainer(object):
                                  oversample_foreground_percent=self.oversample_foreground_percent,
                                  sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
-        dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
+        dl_val = nnUNetDataLoader(dataset_val, max(self.batch_size // 2, 1),
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
@@ -680,11 +688,12 @@ class nnUNetTrainer(object):
             mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
                                                         num_processes=allowed_num_processes,
                                                         num_cached=max(6, allowed_num_processes // 2), seeds=None,
-                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
+                                                        pin_memory=False,#self.device.type == 'cuda',
+                                                        wait_time=0.002)
             mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
                                                       transform=None, num_processes=max(1, allowed_num_processes // 2),
                                                       num_cached=max(3, allowed_num_processes // 4), seeds=None,
-                                                      pin_memory=self.device.type == 'cuda',
+                                                      pin_memory=False,#self.device.type == 'cuda',
                                                       wait_time=0.002)
         # # let's get this party started
         _ = next(mt_gen_train)
@@ -931,8 +940,8 @@ class nnUNetTrainer(object):
 
         self._save_debug_information()
 
-        # print(f"batch size: {self.batch_size}")
-        # print(f"oversample: {self.oversample_foreground_percent}")
+        self.print_to_log_file(f"batch size: {self.batch_size}")
+        self.print_to_log_file(f"oversample: {self.oversample_foreground_percent}")
 
     def on_train_end(self):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
@@ -966,11 +975,11 @@ class nnUNetTrainer(object):
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
-            f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
+            f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=7)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
-    def train_step(self, batch: dict) -> dict:
+    def train_step(self, batch: dict, step_optimizer=True) -> dict:
         data = batch['data']
         target = batch['target']
 
@@ -979,8 +988,11 @@ class nnUNetTrainer(object):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
+        if step_optimizer:
+            self.optimizer.zero_grad(set_to_none=True)
+        #     print('resetting gradients')
+        # else:
+        #     print('accumulating gradients')
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
@@ -989,18 +1001,24 @@ class nnUNetTrainer(object):
             output = self.network(data)
             # del data
             l = self.loss(output, target)
-
+            if self.accumulate_steps > 1:
+                l = l / self.accumulate_steps
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+            if step_optimizer:
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grap_norm)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+            if step_optimizer:
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grap_norm)
+                self.optimizer.step()
+        l = l.detach().cpu().numpy()
+        if self.accumulate_steps > 1: # reverse grad accum
+            l = l * self.accumulate_steps
+        return {'loss': l}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1048,10 +1066,10 @@ class nnUNetTrainer(object):
             predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
         else:
             # no need for softmax
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-            del output_seg
+            # output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.bfloat16) # save mem
+            predicted_segmentation_onehot.scatter_(1, output.argmax(1)[:, None], 1)
+            # del output_seg
 
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
@@ -1070,9 +1088,9 @@ class nnUNetTrainer(object):
 
         tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
 
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
+        tp_hard = tp.detach().cpu().float().numpy()
+        fp_hard = fp.detach().cpu().float().numpy()
+        fn_hard = fn.detach().cpu().float().numpy()
         if not self.label_manager.has_regions:
             # if we train with regions all segmentation heads predict some kind of foreground. In conventional
             # (softmax training) there needs tobe one output for the background. We are not interested in the
@@ -1130,6 +1148,10 @@ class nnUNetTrainer(object):
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
 
+        # check if loss is valid
+        if not np.isfinite(self.logger.my_fantastic_logging['train_losses'][-1]):
+            raise RuntimeError('nan train loss, check input/output or try disabling amp')
+
         # handling periodic checkpointing
         current_epoch = self.current_epoch
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
@@ -1140,6 +1162,8 @@ class nnUNetTrainer(object):
             self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
             self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        else:
+            self.print_to_log_file(f"Current mean pseudo Dice: {np.round(self.logger.my_fantastic_logging['mean_fg_dice'][-1], decimals=4)}")
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
@@ -1355,6 +1379,10 @@ class nnUNetTrainer(object):
             self.print_to_log_file("Validation complete", also_print_to_console=True)
             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
                                    also_print_to_console=True)
+            per_cls_mean = ""
+            for c, v in metrics['mean'].items():
+                per_cls_mean = per_cls_mean + f"{c}: {v['Dice']:.5f}\t"
+            self.print_to_log_file(per_cls_mean, also_print_to_console=True)
 
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
@@ -1368,7 +1396,11 @@ class nnUNetTrainer(object):
             self.on_train_epoch_start()
             train_outputs = []
             for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
+                # perhaps a better way is accumulate is to do 2 mini batch in one self.train_step call
+                step_optimizer = ((batch_id + 1) % self.accumulate_steps == 0) if self.accumulate_steps > 1 else True
+                if not step_optimizer and batch_id + 1 == self.num_iterations_per_epoch: # last index always step
+                    step_optimizer = True
+                train_outputs.append(self.train_step(next(self.dataloader_train), step_optimizer=step_optimizer))
             self.on_train_epoch_end(train_outputs)
 
             with torch.no_grad():
