@@ -16,9 +16,14 @@ if __name__ == "__main__":
     # print({v: k for k, v in mapping_DS119_nocanal().items()})
     os.makedirs(join(root, 'imagesTr'))
     os.makedirs(join(root, 'labelsTr'))
+    os.makedirs(join(root, 'unlabeledTr'))
     for img_path in os.listdir(join(root, 'Images')):
         new_path = img_path.replace('.nii.gz', '_0000.nii.gz')
         os.symlink(join('..', 'Images', img_path), join(root, 'imagesTr', new_path))
+
+    for img_path in os.listdir(join(root, 'Unlabeled')):
+        new_path = img_path.replace('.nii.gz', '_0000.nii.gz')
+        os.symlink(join('..', 'Unlabeled', img_path), join(root, 'unlabeledTr', new_path))
 
     for img_path in os.listdir(join(root, 'Masks')):
         new_path = img_path.replace('_Masks.nii.gz', '.nii.gz')
@@ -56,9 +61,11 @@ if __name__ == "__main__":
               }
             }, f, indent=4
         )
+
+    # unlabeledTr should contain the unlabeled images similar to imagesTr
     with open(join(root, 'splits_final.json'), 'w') as f:
         split = [{"train": sorted([x.replace('.nii.gz', '') for x in os.listdir(join(root, 'labelsTr')) if 'Train' in x]),
                   "unlabeled": sorted([x.replace('_0000.nii.gz', '') for x in os.listdir(join(root, 'unlabeledTr'))]),
-                  "val": sorted([x.replace('.nii.gz', '') for x in os.listdir(join(root, 'labelsTr')) if 'Train' not in x])
+                  "val": sorted([x.replace('.nii.gz', '') for x in os.listdir(join(root, 'labelsTr')) if 'Train' not in x]) # define your train val split here
                   }]
         json.dump(split, f)

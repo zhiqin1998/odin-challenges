@@ -28,7 +28,7 @@ from batchgenerators.utilities.file_and_folder_operations import load_json, join
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
-from nnunetv2.postprocessing.fill_holes import fill_holes
+# from nnunetv2.postprocessing.fill_holes import fill_holes
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.helpers import empty_cache
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
